@@ -3,7 +3,7 @@
 Copy the result to the root of a FAT32 microSD card as /map.raw.
 
   pip install pillow requests
-  python tools/make_map.py LAT LON RADIUS_KM
+  python tools/make_map.py LAT LON RADIUS_MILES
 
 LAT/LON/RADIUS must match what you enter in the device's Wi-Fi setup page.
 Tiles default to CARTO dark (© OpenStreetMap contributors © CARTO). Run it once, not in a loop.
@@ -20,12 +20,12 @@ def merc_y(lat):
     return 0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)
 
 ap = argparse.ArgumentParser()
-ap.add_argument("lat", type=float); ap.add_argument("lon", type=float); ap.add_argument("radius_km", type=float)
+ap.add_argument("lat", type=float); ap.add_argument("lon", type=float); ap.add_argument("radius_miles", type=float)
 ap.add_argument("--tiles", default="https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png")
 ap.add_argument("--out", default="map.raw"); ap.add_argument("--preview", default="map_preview.png")
 a = ap.parse_args()
 
-world_w = 2 * a.radius_km * 1000 / (40075016.686 * math.cos(math.radians(a.lat)))
+world_w = 2 * a.radius_miles * 1609.344 / (40075016.686 * math.cos(math.radians(a.lat)))
 world_h = world_w * H / W
 x0 = merc_x(a.lon) - world_w / 2
 y0 = merc_y(a.lat) - world_h / 2
