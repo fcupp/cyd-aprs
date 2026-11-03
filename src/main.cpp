@@ -123,25 +123,28 @@ void touchInit() {
   pinMode(T_MISO, INPUT); pinMode(T_IRQ, INPUT);
   digitalWrite(T_CS, HIGH); digitalWrite(T_CLK, LOW);
 }
-static uint16_t xptRead(uint8_t cmd) {
-  digitalWrite(T_CS, LOW);
+static uint16_t xptRead(uint8_t cmd) {   // SPI mode 0: MISO is sampled while CLK is high
+  digitalWrite(T_CS, LOW); delayMicroseconds(2);
   for (int i = 7; i >= 0; i--) {
-    digitalWrite(T_MOSI, (cmd >> i) & 1);
+    digitalWrite(T_MOSI, (cmd >> i) & 1); delayMicroseconds(1);
     digitalWrite(T_CLK, HIGH); delayMicroseconds(1); digitalWrite(T_CLK, LOW); delayMicroseconds(1);
   }
-  uint16_t v = 0;
+  uint16_t v = 0;   // 16 clocks: busy bit, 12 data bits, 3 zero bits
   for (int i = 0; i < 16; i++) {
-    digitalWrite(T_CLK, HIGH); delayMicroseconds(1); digitalWrite(T_CLK, LOW); delayMicroseconds(1);
+    digitalWrite(T_CLK, HIGH); delayMicroseconds(1);
     v = (v << 1) | digitalRead(T_MISO);
+    digitalWrite(T_CLK, LOW); delayMicroseconds(1);
   }
   digitalWrite(T_CS, HIGH);
   return (v >> 3) & 0x0FFF;
 }
 bool readRaw(int& rx, int& ry) {
   if (digitalRead(T_IRQ)) return false;
-  long sx = 0, sy = 0;
-  for (int i = 0; i < 4; i++) { sx += xptRead(0xD0); sy += xptRead(0x90); }
-  rx = sx / 4; ry = sy / 4;
+  int xs[5], ys[5];
+  for (int i = 0; i < 5; i++) xs[i] = xptRead(0xD0);   // X, then Y, in batches
+  for (int i = 0; i < 5; i++) ys[i] = xptRead(0x90);
+  std::sort(xs, xs + 5); std::sort(ys, ys + 5);
+  rx = (xs[1] + xs[2] + xs[3]) / 3; ry = (ys[1] + ys[2] + ys[3]) / 3;   // trimmed mean
   return rx > 80 && rx < 4015 && ry > 80 && ry < 4015;
 }
 bool touchScreen(int& x, int& y) {
@@ -191,6 +194,7 @@ static bool solve3(double M[3][3], double v[3], double o[3]) {   // Gaussian eli
 // 5 taps (4 corners + centre), least-squares affine fit: handles swap, inversion, skew.
 void calibrate() {
   const int sxp[5] = {20, 300, 300, 20, 160}, syp[5] = {20, 20, 220, 220, 120};
+  int tries = 0;
   for (;;) {
     double rx[5], ry[5];
     for (int i = 0; i < 5; i++) { drawCross(sxp[i], syp[i]); int a, b; waitTap(a, b); rx[i] = a; ry[i] = b; }
@@ -210,7 +214,10 @@ void calibrate() {
       double ex = ox[0] * rx[i] + ox[1] * ry[i] + ox[2] - sxp[i], ey = oy[0] * rx[i] + oy[1] * ry[i] + oy[2] - syp[i];
       double e = sqrt(ex * ex + ey * ey); if (e > worst) worst = e;
     }
-    if (worst > 25) { msg("Try again", "Taps were inconsistent"); delay(1200); continue; }
+    if (worst > 30 && ++tries < 3) {
+      char e[40]; snprintf(e, sizeof(e), "Error %.0f px - retrying", worst);
+      msg("Try again", e); delay(1500); continue;
+    }
     for (int i = 0; i < 3; i++) { cal.k[i] = ox[i]; cal.k[3 + i] = oy[i]; }
     cal.valid = true; saveCal();
     char b[32]; snprintf(b, sizeof(b), "Worst error %.0f px", worst);
