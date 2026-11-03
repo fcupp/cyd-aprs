@@ -273,7 +273,7 @@ void drawList() {
 void handleTap(int x, int y) {
   if (listView) { listView = false; redraw(); return; }
   if (y < 14) { selIdx = -1; setView(wx0 + worldW / 2, wy0 + worldH / 2, 1); redraw(); return; }
-  int best = -1, bd = 18 * 18;
+  int best = -1, bd = 32 * 32;   // generous: fingers are imprecise
   for (int i = 0; i < MAX_ST; i++) {
     if (!st[i].used) continue;
     int sx, sy; project(st[i].lat, st[i].lon, sx, sy);
@@ -373,7 +373,14 @@ void loop() {
   lastBtn = b;
 
   int tx, ty; bool t = touchScreen(tx, ty);
-  if (t && !wasTouch && millis() - lastTap > 300) { lastTap = millis(); handleTap(tx, ty); }
+  if (t && !wasTouch && millis() - lastTap > 300) {
+    lastTap = millis();
+    // first contact is noisy: average a few samples once the finger has settled
+    long sx = 0, sy = 0; int n = 0;
+    for (int i = 0; i < 4; i++) { int ax, ay; delay(12); if (touchScreen(ax, ay)) { sx += ax; sy += ay; n++; } }
+    if (n) { tx = sx / n; ty = sy / n; }
+    handleTap(tx, ty);
+  }
   wasTouch = t;
 
   if (!client.connected()) {
