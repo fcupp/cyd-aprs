@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CYD APRS Map – Web Flasher</title>
+<script type="module" src="https://unpkg.com/esp-web-tools@10.0.1/dist/web/install-button.js?module"></script>
+<style>
+  :root{color-scheme:light dark;font-family:system-ui,sans-serif}
+  body{max-width:40rem;margin:2rem auto;padding:0 1rem;line-height:1.5}
+  .card{border:1px solid #8884;border-radius:12px;padding:1rem 1.25rem;margin:1rem 0}
+</style></head><body>
+<h1>CYD APRS Map</h1>
+<p>Plug the CYD in over USB, then click a button. Needs Chrome or Edge (Web Serial).</p>
+<div class="card"><h3>Board with USB-C + micro-USB</h3>
+  <esp-web-install-button manifest="manifest-st7789.json"></esp-web-install-button></div>
+<div class="card"><h3>Board with micro-USB only</h3>
+  <esp-web-install-button manifest="manifest-ili9341.json"></esp-web-install-button></div>
+<p>After flashing, join the Wi-Fi network <b>CYD-APRS-Setup</b> and open <b>192.168.4.1</b> to enter your Wi-Fi, callsign, home position and radius.</p>
+</body></html>
