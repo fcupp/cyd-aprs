@@ -2,10 +2,12 @@
 // Touch: tap a station = details; tap empty map = zoom in 2x (max 4x) centred there;
 //        tap the top status bar = reset zoom. Tap list view = back to map.
 // BOOT button: short press = toggle map/list, hold >1.5 s = recalibrate touch,
-//              hold at power-up = reset Wi-Fi/config.
+//              hold >6 s = erase Wi-Fi and reopen the setup portal.
+// Setup page: once on Wi-Fi, browse to the IP shown at boot (or http://cyd-aprs.local).
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <SPI.h>
 #include <SD.h>
@@ -33,6 +35,9 @@ TFT_eSPI tft;
 SPIClass sdSPI(HSPI);
 Preferences prefs;
 WiFiClient client;
+WiFiManager wm;
+WiFiManagerParameter *pCall, *pSrv, *pPort, *pLat, *pLon, *pRad;
+bool saveFlag = false;
 
 char cCall[12] = "N0CALL", cServer[40] = "rotate.aprs2.net", cPort[8] = "14580";
 char cLat[12] = "0.0", cLon[12] = "0.0", cRad[8] = "50";
@@ -263,11 +268,13 @@ void drawList() {
   std::sort(idx, idx + n, [](int a, int b) { return st[a].seen > st[b].seen; });
   tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.drawString("CALL        km    age", 4, 2, 2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  for (int i = 0; i < n && i < 13; i++) {
+  for (int i = 0; i < n && i < 12; i++) {
     Station& s = st[idx[i]]; char b[48];
     snprintf(b, sizeof(b), "%-9s %4.0f  %3lum", s.call, distKm(homeLat, homeLon, s.lat, s.lon), (millis() - s.seen) / 60000UL);
     tft.drawString(b, 4, 20 + i * 16, 2);
   }
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString(("Setup: http://" + WiFi.localIP().toString()).c_str(), 4, 222, 2);
 }
 
 void handleTap(int x, int y) {
@@ -311,7 +318,13 @@ void pumpAprs() {
 }
 
 // ---- setup / loop ----
-bool saveFlag = false;
+void applyParams() {
+  strlcpy(cCall, pCall->getValue(), sizeof(cCall)); strlcpy(cServer, pSrv->getValue(), sizeof(cServer));
+  strlcpy(cPort, pPort->getValue(), sizeof(cPort)); strlcpy(cLat, pLat->getValue(), sizeof(cLat));
+  strlcpy(cLon, pLon->getValue(), sizeof(cLon)); strlcpy(cRad, pRad->getValue(), sizeof(cRad));
+  for (char* c = cCall; *c; c++) *c = toupper(*c);
+  saveCfg();
+}
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_BOOT, INPUT_PULLUP);
@@ -324,27 +337,22 @@ void setup() {
   loadCfg();
   touchInit();
 
-  WiFiManager wm;
-  uint32_t t0 = millis();
-  while (digitalRead(PIN_BOOT) == LOW && millis() - t0 < 3000) delay(50);
-  if (digitalRead(PIN_BOOT) == LOW) { wm.resetSettings(); msg("Settings reset", "Release BOOT"); delay(1500); }
-
-  WiFiManagerParameter pCall("call", "Callsign", cCall, 11), pSrv("server", "APRS-IS server", cServer, 39),
-      pPort("port", "Port", cPort, 7), pLat("lat", "Home latitude (e.g. 37.27)", cLat, 11),
-      pLon("lon", "Home longitude (e.g. -79.94)", cLon, 11), pRad("rad", "Radius km (map half-width)", cRad, 7);
-  WiFiManagerParameter* ps[] = {&pCall, &pSrv, &pPort, &pLat, &pLon, &pRad};
+  pCall = new WiFiManagerParameter("call", "Callsign", cCall, 11);
+  pSrv = new WiFiManagerParameter("server", "APRS-IS server", cServer, 39);
+  pPort = new WiFiManagerParameter("port", "Port", cPort, 7);
+  pLat = new WiFiManagerParameter("lat", "Home latitude (e.g. 37.27)", cLat, 11);
+  pLon = new WiFiManagerParameter("lon", "Home longitude (e.g. -79.94)", cLon, 11);
+  pRad = new WiFiManagerParameter("rad", "Radius km (map half-width)", cRad, 7);
+  WiFiManagerParameter* ps[] = {pCall, pSrv, pPort, pLat, pLon, pRad};
   for (auto* p : ps) wm.addParameter(p);
   wm.setSaveParamsCallback([]() { saveFlag = true; });
   wm.setAPCallback([](WiFiManager*) { msg("Setup: join Wi-Fi", "CYD-APRS-Setup -> 192.168.4.1"); });
   wm.setConfigPortalTimeout(300);
   if (!wm.autoConnect("CYD-APRS-Setup")) { delay(1000); ESP.restart(); }
-  if (saveFlag) {
-    strlcpy(cCall, pCall.getValue(), sizeof(cCall)); strlcpy(cServer, pSrv.getValue(), sizeof(cServer));
-    strlcpy(cPort, pPort.getValue(), sizeof(cPort)); strlcpy(cLat, pLat.getValue(), sizeof(cLat));
-    strlcpy(cLon, pLon.getValue(), sizeof(cLon)); strlcpy(cRad, pRad.getValue(), sizeof(cRad));
-    for (char* c = cCall; *c; c++) *c = toupper(*c);
-    saveCfg();
-  }
+  if (saveFlag) { applyParams(); saveFlag = false; }
+  wm.setConfigPortalBlocking(false);
+  wm.startWebPortal();   // setup page stays available on the LAN
+  MDNS.begin("cyd-aprs"); MDNS.addService("http", "tcp", 80);
   homeLat = atof(cLat); homeLon = atof(cLon); radiusKm = max(1.0, atof(cRad));
   setupProjection();
 
@@ -355,19 +363,25 @@ void setup() {
     if (f) f.close();
   }
   if (!cal.valid) calibrate();
-  msg(haveMap ? "Map found on SD" : "No /map.raw on SD", "Using grid fallback if missing");
-  delay(800);
+  msg("Setup page (same Wi-Fi):", ("http://" + WiFi.localIP().toString()).c_str());
+  tft.drawString("or http://cyd-aprs.local", 8, 52, 2);
+  tft.drawString(haveMap ? "Map: SD card ok" : "Map: none (grid)", 8, 74, 2);
+  delay(3500);
 }
 
 void loop() {
   static bool lastBtn = true, wasTouch = false;
   static uint32_t btnDown = 0, lastTap = 0;
 
+  wm.process();
+  if (saveFlag) { applyParams(); msg("Saved", "Restarting..."); delay(1200); ESP.restart(); }
+
   bool b = digitalRead(PIN_BOOT);
   if (!b && lastBtn) btnDown = millis();
   if (b && !lastBtn) {
     uint32_t held = millis() - btnDown;
-    if (held > 1500) { calibrate(); redraw(); }
+    if (held > 6000) { wm.resetSettings(); msg("Wi-Fi settings erased", "Restarting..."); delay(1500); ESP.restart(); }
+    else if (held > 1500) { calibrate(); redraw(); }
     else if (held > 40) { listView = !listView; redraw(); }
   }
   lastBtn = b;
