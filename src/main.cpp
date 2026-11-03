@@ -1,5 +1,5 @@
 // CYD APRS map: APRS-IS (read-only) -> 320x240 map with station dots.
-// Touch: tap LIST (top right) = station list, tap a row = details, SHOW ON MAP jumps to it.
+// Touch: tap LIST (top right) = station list, tap a row = details (list is nearest-first), SHOW ON MAP jumps to it.
 //        Tap a station on the map = quick details; tap empty map = zoom in 2x (max 4x);
 //        tap the top status bar = reset zoom.
 // BOOT button: short press = toggle map/list, hold >1.5 s = recalibrate touch,
@@ -53,7 +53,7 @@ int selIdx = -1;
 char lineBuf[512]; size_t lineLen = 0;
 uint32_t lastKeep = 0, lastTry = 0, lastDraw = 0, pktCount = 0;
 
-struct Cal { bool valid = false, swap = false; int a0 = 0, a1 = 0, b0 = 0, b1 = 0; } cal;
+struct Cal { bool valid = false; float k[6] = {0, 0, 0, 0, 0, 0}; } cal;   // sx=k0*rx+k1*ry+k2, sy=k3*rx+k4*ry+k5
 
 // ---- projection (must match tools/make_map.py) ----
 static double mercX(double lon) { return (lon + 180.0) / 360.0; }
@@ -75,10 +75,10 @@ bool project(double lat, double lon, int& x, int& y) {
   y = (int)((mercY(lat) - vy0) / vH * SCR_H);
   return x >= 0 && x < SCR_W && y >= 0 && y < SCR_H;
 }
-double distKm(double la1, double lo1, double la2, double lo2) {
+double distMi(double la1, double lo1, double la2, double lo2) {
   double dl = (la2 - la1) * DEG_TO_RAD, dn = (lo2 - lo1) * DEG_TO_RAD;
   double a = sin(dl / 2) * sin(dl / 2) + cos(la1 * DEG_TO_RAD) * cos(la2 * DEG_TO_RAD) * sin(dn / 2) * sin(dn / 2);
-  return 12742.0 * asin(sqrt(a));
+  return 7917.6 * asin(sqrt(a));
 }
 double bearingDeg(double la1, double lo1, double la2, double lo2) {
   double p1 = la1 * DEG_TO_RAD, p2 = la2 * DEG_TO_RAD, dl = (lo2 - lo1) * DEG_TO_RAD;
@@ -95,9 +95,8 @@ void loadCfg() {
   strlcpy(cLat, prefs.getString("lat", cLat).c_str(), sizeof(cLat));
   strlcpy(cLon, prefs.getString("lon", cLon).c_str(), sizeof(cLon));
   strlcpy(cRad, prefs.getString("rad", cRad).c_str(), sizeof(cRad));
-  cal.valid = prefs.getBool("cv", false); cal.swap = prefs.getBool("cs", false);
-  cal.a0 = prefs.getInt("ca0", 0); cal.a1 = prefs.getInt("ca1", 0);
-  cal.b0 = prefs.getInt("cb0", 0); cal.b1 = prefs.getInt("cb1", 0);
+  cal.valid = prefs.getBool("cv2", false);
+  for (int i = 0; i < 6; i++) cal.k[i] = prefs.getFloat(("k" + String(i)).c_str(), 0);
   prefs.end();
 }
 void saveCfg() {
@@ -108,9 +107,8 @@ void saveCfg() {
 }
 void saveCal() {
   prefs.begin("aprs", false);
-  prefs.putBool("cv", cal.valid); prefs.putBool("cs", cal.swap);
-  prefs.putInt("ca0", cal.a0); prefs.putInt("ca1", cal.a1);
-  prefs.putInt("cb0", cal.b0); prefs.putInt("cb1", cal.b1);
+  prefs.putBool("cv2", cal.valid);
+  for (int i = 0; i < 6; i++) prefs.putFloat(("k" + String(i)).c_str(), cal.k[i]);
   prefs.end();
 }
 void msg(const char* a, const char* b = "") {
@@ -149,9 +147,8 @@ bool readRaw(int& rx, int& ry) {
 bool touchScreen(int& x, int& y) {
   int rx, ry;
   if (!cal.valid || !readRaw(rx, ry)) return false;
-  int a = cal.swap ? ry : rx, b = cal.swap ? rx : ry;
-  x = 20 + (long)(a - cal.a0) * 280 / (cal.a1 - cal.a0);
-  y = 20 + (long)(b - cal.b0) * 200 / (cal.b1 - cal.b0);
+  x = (int)lround(cal.k[0] * rx + cal.k[1] * ry + cal.k[2]);
+  y = (int)lround(cal.k[3] * rx + cal.k[4] * ry + cal.k[5]);
   x = constrain(x, 0, SCR_W - 1); y = constrain(y, 0, SCR_H - 1);
   return true;
 }
@@ -169,17 +166,56 @@ void waitTap(int& rx, int& ry) {
   while (digitalRead(T_IRQ) == LOW) delay(10);
   delay(250);
 }
+static bool solve3(double M[3][3], double v[3], double o[3]) {   // Gaussian elimination
+  for (int i = 0; i < 3; i++) {
+    int p = i;
+    for (int r = i + 1; r < 3; r++) if (fabs(M[r][i]) > fabs(M[p][i])) p = r;
+    if (fabs(M[p][i]) < 1e-9) return false;
+    if (p != i) {
+      for (int c = 0; c < 3; c++) { double t = M[i][c]; M[i][c] = M[p][c]; M[p][c] = t; }
+      double t = v[i]; v[i] = v[p]; v[p] = t;
+    }
+    for (int r = i + 1; r < 3; r++) {
+      double f = M[r][i] / M[i][i];
+      for (int c = i; c < 3; c++) M[r][c] -= f * M[i][c];
+      v[r] -= f * v[i];
+    }
+  }
+  for (int i = 2; i >= 0; i--) {
+    double sum = v[i];
+    for (int c = i + 1; c < 3; c++) sum -= M[i][c] * o[c];
+    o[i] = sum / M[i][i];
+  }
+  return true;
+}
+// 5 taps (4 corners + centre), least-squares affine fit: handles swap, inversion, skew.
 void calibrate() {
+  const int sxp[5] = {20, 300, 300, 20, 160}, syp[5] = {20, 20, 220, 220, 120};
   for (;;) {
-    int ax, ay, bx, by;
-    drawCross(20, 20); waitTap(ax, ay);
-    drawCross(300, 220); waitTap(bx, by);
-    int dx = bx - ax, dy = by - ay;
-    if (abs(dx) < 800 || abs(dy) < 800) { msg("Try again", "Tap each cross firmly"); delay(1200); continue; }
-    cal.swap = abs(dy) > abs(dx);
-    if (!cal.swap) { cal.a0 = ax; cal.a1 = bx; cal.b0 = ay; cal.b1 = by; }
-    else           { cal.a0 = ay; cal.a1 = by; cal.b0 = ax; cal.b1 = bx; }
-    cal.valid = true; saveCal(); break;
+    double rx[5], ry[5];
+    for (int i = 0; i < 5; i++) { drawCross(sxp[i], syp[i]); int a, b; waitTap(a, b); rx[i] = a; ry[i] = b; }
+    double A[3][3] = {}, bx[3] = {}, by[3] = {};
+    for (int i = 0; i < 5; i++) {
+      double r[3] = {rx[i], ry[i], 1};
+      for (int p = 0; p < 3; p++) {
+        for (int q = 0; q < 3; q++) A[p][q] += r[p] * r[q];
+        bx[p] += r[p] * sxp[i]; by[p] += r[p] * syp[i];
+      }
+    }
+    double A2[3][3]; memcpy(A2, A, sizeof(A));
+    double ox[3], oy[3];
+    if (!solve3(A, bx, ox) || !solve3(A2, by, oy)) { msg("Try again", "Tap each cross firmly"); delay(1200); continue; }
+    double worst = 0;
+    for (int i = 0; i < 5; i++) {
+      double ex = ox[0] * rx[i] + ox[1] * ry[i] + ox[2] - sxp[i], ey = oy[0] * rx[i] + oy[1] * ry[i] + oy[2] - syp[i];
+      double e = sqrt(ex * ex + ey * ey); if (e > worst) worst = e;
+    }
+    if (worst > 25) { msg("Try again", "Taps were inconsistent"); delay(1200); continue; }
+    for (int i = 0; i < 3; i++) { cal.k[i] = ox[i]; cal.k[3 + i] = oy[i]; }
+    cal.valid = true; saveCal();
+    char b[32]; snprintf(b, sizeof(b), "Worst error %.0f px", worst);
+    msg("Touch calibrated", b); delay(1200);
+    break;
   }
 }
 
@@ -242,7 +278,7 @@ void drawPopup() {
   char b[72];
   snprintf(b, sizeof(b), "%.4f  %.4f", s.lat, s.lon);
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK); tft.drawString(b, 120, py + 7, 1);
-  snprintf(b, sizeof(b), "%.1f km  %03.0f deg  %lu min ago", distKm(homeLat, homeLon, s.lat, s.lon),
+  snprintf(b, sizeof(b), "%.1f mi  %03.0f deg  %lu min ago", distMi(homeLat, homeLon, s.lat, s.lon),
            bearingDeg(homeLat, homeLon, s.lat, s.lon), (millis() - s.seen) / 60000UL);
   tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.drawString(b, 6, py + 23, 2);
 }
@@ -276,11 +312,13 @@ void drawList() {
   tft.fillScreen(TFT_BLACK);
   listN = 0;
   for (int i = 0; i < MAX_ST; i++) if (st[i].used) listIdx[listN++] = i;
-  std::sort(listIdx, listIdx + listN, [](int a, int b) { return st[a].seen > st[b].seen; });
+  std::sort(listIdx, listIdx + listN, [](int a, int b) {   // nearest to home first
+    return distMi(homeLat, homeLon, st[a].lat, st[a].lon) < distMi(homeLat, homeLon, st[b].lat, st[b].lon);
+  });
   int pages = max(1, (listN + 7) / 8);
   listPage = constrain(listPage, 0, pages - 1);
   char b[48];
-  tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.drawString("CALL        km    age", 4, 2, 2);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.drawString("CALL        mi    age", 4, 2, 2);
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK); tft.drawString(WiFi.localIP().toString().c_str(), 185, 6, 1);
   snprintf(b, sizeof(b), "%d/%d", listPage + 1, pages);
   tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.drawString(b, 288, 2, 2);
@@ -288,7 +326,7 @@ void drawList() {
   for (int r = 0; r < 8; r++) {
     int i = listPage * 8 + r; if (i >= listN) break;
     Station& s = st[listIdx[i]]; int y = 20 + r * 24;
-    snprintf(b, sizeof(b), "%-9s %4.0f  %3lum", s.call, distKm(homeLat, homeLon, s.lat, s.lon), (millis() - s.seen) / 60000UL);
+    snprintf(b, sizeof(b), "%-9s %4.0f  %3lum", s.call, distMi(homeLat, homeLon, s.lat, s.lon), (millis() - s.seen) / 60000UL);
     tft.drawString(b, 4, y + 4, 2);
     tft.drawFastHLine(0, y + 23, SCR_W, 0x2104);
   }
@@ -303,7 +341,7 @@ void drawDetail() {
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   char b[64];
   snprintf(b, sizeof(b), "%.4f, %.4f", s.lat, s.lon); tft.drawString(b, 8, 56, 2);
-  snprintf(b, sizeof(b), "%.1f km  %03.0f deg from home", distKm(homeLat, homeLon, s.lat, s.lon),
+  snprintf(b, sizeof(b), "%.1f mi  %03.0f deg from home", distMi(homeLat, homeLon, s.lat, s.lon),
            bearingDeg(homeLat, homeLon, s.lat, s.lon)); tft.drawString(b, 8, 86, 2);
   snprintf(b, sizeof(b), "heard %lu min ago", (millis() - s.seen) / 60000UL); tft.drawString(b, 8, 116, 2);
   snprintf(b, sizeof(b), "Symbol: %c%c", (s.table >= 33 && s.table < 127) ? s.table : '?', (s.code >= 33 && s.code < 127) ? s.code : '?');
@@ -337,7 +375,7 @@ void handleTap(int x, int y) {
   if (view != VIEW_MAP) { handleTapOther(x, y); return; }
   if (y < 22 && x >= SCR_W - 64) { view = VIEW_LIST; redraw(); return; }
   if (y < 18) { selIdx = -1; setView(wx0 + worldW / 2, wy0 + worldH / 2, 1); redraw(); return; }
-  int best = -1, bd = 32 * 32;   // generous: fingers are imprecise
+  int best = -1, bd = 28 * 28;   // generous: fingers are imprecise
   for (int i = 0; i < MAX_ST; i++) {
     if (!st[i].used) continue;
     int sx, sy; project(st[i].lat, st[i].lon, sx, sy);
@@ -356,7 +394,7 @@ void handleTap(int x, int y) {
 // ---- APRS-IS ----
 bool connectAprs() {
   if (!client.connect(cServer, atoi(cPort), 5000)) return false;
-  client.printf("user %s pass -1 vers CYDAPRS 0.2 filter r/%s/%s/%s\r\n", cCall, cLat, cLon, cRad);
+  client.printf("user %s pass -1 vers CYDAPRS 0.3 filter r/%s/%s/%.1f\r\n", cCall, cLat, cLon, radiusKm);
   lastKeep = millis(); lineLen = 0;
   return true;
 }
@@ -399,7 +437,7 @@ void setup() {
   pPort = new WiFiManagerParameter("port", "Port", cPort, 7);
   pLat = new WiFiManagerParameter("lat", "Home latitude (e.g. 37.27)", cLat, 11);
   pLon = new WiFiManagerParameter("lon", "Home longitude (e.g. -79.94)", cLon, 11);
-  pRad = new WiFiManagerParameter("rad", "Radius km (map half-width)", cRad, 7);
+  pRad = new WiFiManagerParameter("rad", "Radius miles (map half-width)", cRad, 7);
   WiFiManagerParameter* ps[] = {pCall, pSrv, pPort, pLat, pLon, pRad};
   for (auto* p : ps) wm.addParameter(p);
   wm.setSaveParamsCallback([]() { saveFlag = true; });
@@ -410,7 +448,7 @@ void setup() {
   wm.setConfigPortalBlocking(false);
   wm.startWebPortal();   // setup page stays available on the LAN
   MDNS.begin("cyd-aprs"); MDNS.addService("http", "tcp", 80);
-  homeLat = atof(cLat); homeLon = atof(cLon); radiusKm = max(1.0, atof(cRad));
+  homeLat = atof(cLat); homeLon = atof(cLon); radiusKm = max(1.6, atof(cRad) * 1.609344);   // setup page is in miles; APRS-IS filter and projection use km
   setupProjection();
 
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
