@@ -1,6 +1,7 @@
 // CYD APRS map: APRS-IS (read-only) -> 320x240 map with station dots.
-// Touch: tap a station = details; tap empty map = zoom in 2x (max 4x) centred there;
-//        tap the top status bar = reset zoom. Tap list view = back to map.
+// Touch: tap LIST (top right) = station list, tap a row = details, SHOW ON MAP jumps to it.
+//        Tap a station on the map = quick details; tap empty map = zoom in 2x (max 4x);
+//        tap the top status bar = reset zoom.
 // BOOT button: short press = toggle map/list, hold >1.5 s = recalibrate touch,
 //              hold >6 s = erase Wi-Fi and reopen the setup portal.
 // Setup page: once on Wi-Fi, browse to the IP shown at boot (or http://cyd-aprs.local).
@@ -43,7 +44,9 @@ char cCall[12] = "N0CALL", cServer[40] = "rotate.aprs2.net", cPort[8] = "14580";
 char cLat[12] = "0.0", cLon[12] = "0.0", cRad[8] = "50";
 
 Station st[MAX_ST];
-bool haveMap = false, dirty = true, listView = false, aprsOk = false;
+bool haveMap = false, dirty = true, aprsOk = false;
+enum { VIEW_MAP, VIEW_LIST, VIEW_DETAIL };
+int view = VIEW_MAP, listPage = 0, detailIdx = -1, listIdx[MAX_ST], listN = 0;
 double homeLat, homeLon, radiusKm, wx0, wy0, worldW, worldH;   // full extent
 double vx0, vy0, vW, vH; int zf = 1;                           // current view
 int selIdx = -1;
@@ -225,6 +228,8 @@ void drawStatus() {
   if (zf > 1) snprintf(b, sizeof(b), " %s  %d stn  %dx  %s ", cCall, n, zf, aprsOk ? "APRS-IS ok" : "connecting");
   else snprintf(b, sizeof(b), " %s  %d stn  %s ", cCall, n, aprsOk ? "APRS-IS ok" : "connecting");
   tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.drawString(b, 0, 0, 1);
+  tft.fillRect(SCR_W - 50, 0, 50, 14, 0x2945);
+  tft.setTextColor(TFT_WHITE, 0x2945); tft.drawCentreString("LIST", SCR_W - 25, 3, 1);
 }
 
 void drawPopup() {
@@ -261,25 +266,77 @@ void drawMap() {
   drawPopup();
 }
 
+void drawButton(int x, int y, int w, int h, const char* label) {
+  const uint16_t c = 0x2945;
+  tft.fillRoundRect(x, y, w, h, 6, c); tft.drawRoundRect(x, y, w, h, 6, TFT_DARKGREY);
+  tft.setTextColor(TFT_WHITE, c); tft.drawCentreString(label, x + w / 2, y + (h - 16) / 2, 2);
+}
+
 void drawList() {
   tft.fillScreen(TFT_BLACK);
-  int idx[MAX_ST], n = 0;
-  for (int i = 0; i < MAX_ST; i++) if (st[i].used) idx[n++] = i;
-  std::sort(idx, idx + n, [](int a, int b) { return st[a].seen > st[b].seen; });
+  listN = 0;
+  for (int i = 0; i < MAX_ST; i++) if (st[i].used) listIdx[listN++] = i;
+  std::sort(listIdx, listIdx + listN, [](int a, int b) { return st[a].seen > st[b].seen; });
+  int pages = max(1, (listN + 7) / 8);
+  listPage = constrain(listPage, 0, pages - 1);
+  char b[48];
   tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.drawString("CALL        km    age", 4, 2, 2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK); tft.drawString(WiFi.localIP().toString().c_str(), 185, 6, 1);
+  snprintf(b, sizeof(b), "%d/%d", listPage + 1, pages);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.drawString(b, 288, 2, 2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  for (int i = 0; i < n && i < 12; i++) {
-    Station& s = st[idx[i]]; char b[48];
+  for (int r = 0; r < 8; r++) {
+    int i = listPage * 8 + r; if (i >= listN) break;
+    Station& s = st[listIdx[i]]; int y = 20 + r * 24;
     snprintf(b, sizeof(b), "%-9s %4.0f  %3lum", s.call, distKm(homeLat, homeLon, s.lat, s.lon), (millis() - s.seen) / 60000UL);
-    tft.drawString(b, 4, 20 + i * 16, 2);
+    tft.drawString(b, 4, y + 4, 2);
+    tft.drawFastHLine(0, y + 23, SCR_W, 0x2104);
   }
-  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.drawString(("Setup: http://" + WiFi.localIP().toString()).c_str(), 4, 222, 2);
+  drawButton(2, 214, 100, 24, "< PREV"); drawButton(110, 214, 100, 24, "MAP"); drawButton(218, 214, 100, 24, "NEXT >");
+}
+
+void drawDetail() {
+  if (detailIdx < 0 || !st[detailIdx].used) { view = VIEW_LIST; drawList(); return; }
+  Station& s = st[detailIdx];
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK); tft.setTextSize(2); tft.drawString(s.call, 8, 8, 2); tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  char b[64];
+  snprintf(b, sizeof(b), "%.4f, %.4f", s.lat, s.lon); tft.drawString(b, 8, 56, 2);
+  snprintf(b, sizeof(b), "%.1f km  %03.0f deg from home", distKm(homeLat, homeLon, s.lat, s.lon),
+           bearingDeg(homeLat, homeLon, s.lat, s.lon)); tft.drawString(b, 8, 86, 2);
+  snprintf(b, sizeof(b), "heard %lu min ago", (millis() - s.seen) / 60000UL); tft.drawString(b, 8, 116, 2);
+  snprintf(b, sizeof(b), "Symbol: %c%c", (s.table >= 33 && s.table < 127) ? s.table : '?', (s.code >= 33 && s.code < 127) ? s.code : '?');
+  tft.drawString(b, 8, 146, 2);
+  drawButton(10, 190, 140, 44, "BACK"); drawButton(170, 190, 140, 44, "SHOW ON MAP");
+}
+
+void handleTapOther(int x, int y) {
+  if (view == VIEW_LIST) {
+    if (y >= 214) {
+      int pages = max(1, (listN + 7) / 8);
+      if (x < 106) listPage = (listPage + pages - 1) % pages;
+      else if (x < 214) view = VIEW_MAP;
+      else listPage = (listPage + 1) % pages;
+    } else if (y >= 20 && y < 212) {
+      int i = listPage * 8 + (y - 20) / 24;
+      if (i < listN) { detailIdx = listIdx[i]; view = VIEW_DETAIL; }
+    }
+  } else {  // detail
+    if (y >= 180) {
+      if (x < 160) view = VIEW_LIST;
+      else if (detailIdx >= 0 && st[detailIdx].used) {
+        selIdx = detailIdx; setView(mercX(st[detailIdx].lon), mercY(st[detailIdx].lat), 2); view = VIEW_MAP;
+      }
+    }
+  }
+  redraw();
 }
 
 void handleTap(int x, int y) {
-  if (listView) { listView = false; redraw(); return; }
-  if (y < 14) { selIdx = -1; setView(wx0 + worldW / 2, wy0 + worldH / 2, 1); redraw(); return; }
+  if (view != VIEW_MAP) { handleTapOther(x, y); return; }
+  if (y < 22 && x >= SCR_W - 64) { view = VIEW_LIST; redraw(); return; }
+  if (y < 18) { selIdx = -1; setView(wx0 + worldW / 2, wy0 + worldH / 2, 1); redraw(); return; }
   int best = -1, bd = 32 * 32;   // generous: fingers are imprecise
   for (int i = 0; i < MAX_ST; i++) {
     if (!st[i].used) continue;
@@ -382,7 +439,7 @@ void loop() {
     uint32_t held = millis() - btnDown;
     if (held > 6000) { wm.resetSettings(); msg("Wi-Fi settings erased", "Restarting..."); delay(1500); ESP.restart(); }
     else if (held > 1500) { calibrate(); redraw(); }
-    else if (held > 40) { listView = !listView; redraw(); }
+    else if (held > 40) { view = (view == VIEW_MAP) ? VIEW_LIST : VIEW_MAP; redraw(); }
   }
   lastBtn = b;
 
@@ -406,8 +463,11 @@ void loop() {
     if (millis() - lastKeep > 20000) { client.print("#keepalive\r\n"); lastKeep = millis(); }
   }
 
-  if ((dirty && millis() - lastDraw > 2000) || millis() - lastDraw > 15000) {
-    listView ? drawList() : drawMap();
+  // list/detail screens only redraw on taps (or every 30 s) so they don't flicker under your finger
+  bool due = (view == VIEW_MAP) ? ((dirty && millis() - lastDraw > 2000) || millis() - lastDraw > 15000)
+                                : (lastDraw == 0 || millis() - lastDraw > 30000);
+  if (due) {
+    if (view == VIEW_MAP) drawMap(); else if (view == VIEW_LIST) drawList(); else drawDetail();
     lastDraw = millis(); dirty = false;
   }
   delay(5);
