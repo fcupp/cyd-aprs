@@ -1,0 +1,35 @@
+name: build-and-deploy
+on:
+  push: { branches: [main] }
+  workflow_dispatch: {}
+permissions: { contents: read, pages: write, id-token: write }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install platformio "esptool<5"
+      - run: pio run
+      - name: Merge images for web flashing
+        run: |
+          mkdir -p web/firmware
+          BOOT_APP0=$(find ~/.platformio/packages/framework-arduinoespressif32 -name boot_app0.bin | head -n1)
+          for env in cyd cyd_ili9341; do
+            d=.pio/build/$env
+            esptool.py --chip esp32 merge_bin -o web/firmware/$env.bin \
+              --flash_mode dio --flash_freq 40m --flash_size 4MB \
+              0x1000 $d/bootloader.bin 0x8000 $d/partitions.bin 0xe000 "$BOOT_APP0" 0x10000 $d/firmware.bin
+          done
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: web }
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.d.outputs.page_url }}
+    steps:
+      - id: d
+        uses: actions/deploy-pages@v4
